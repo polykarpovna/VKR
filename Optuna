@@ -1,0 +1,132 @@
+import optuna
+from catboost import CatBoostRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import pandas as pd
+import numpy as np
+
+# ==========================================
+# 1. ПОДГОТОВКА ДАННЫХ (хронологическое разбиение 80/10/10)
+# ==========================================
+# Предполагается, что df — ваш очищенный датасет с ненулевыми продажами
+# и колонкой 'depdate' (datetime)
+df = df.sort_values('depdate').reset_index(drop=True)
+
+n = len(df)
+train_end = int(n * 0.80)
+val_end = int(n * 0.90)
+
+train = df.iloc[:train_end]
+val = df.iloc[train_end:val_end]
+test = df.iloc[val_end:]
+
+X_train, y_train = train.drop(columns=['quantity']), train['quantity']
+X_val, y_val = val.drop(columns=['quantity']), val['quantity']
+X_test, y_test = test.drop(columns=['quantity']), test['quantity']
+
+cat_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+
+# ==========================================
+# 2. ФУНКЦИЯ ЦЕЛИ ДЛЯ OPTUNA
+# ==========================================
+def objective(trial):
+    params = {
+        'iterations': trial.suggest_int('iterations', 100, 400),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'depth': trial.suggest_int('depth', 4, 10),
+        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1.0, 10.0, log=True),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'random_seed': 42,
+        'verbose': 0,
+        'cat_features': cat_cols,
+        'task_type': 'CPU'
+    }
+    
+    model = CatBoostRegressor(**params)
+    model.fit(
+        X_train, y_train,
+        eval_set=(X_val, y_val),
+        early_stopping_rounds=30,
+        use_best_model=True
+    )
+    
+    y_pred = model.predict(X_val)
+    mae = mean_absolute_error(y_val, y_pred)
+    return mae
+
+# ==========================================
+# 3. ЗАПУСК ОПТИМИЗАЦИИ
+# ==========================================
+print("⏳ Запуск байесовской оптимизации Optuna (50 итераций)...")
+study = optuna.create_study(
+    direction='minimize',
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+
+# ==========================================
+# 4. РЕЗУЛЬТАТЫ
+# ==========================================
+print("\n" + "="*60)
+print(" ЛУЧШИЕ ГИПЕРПАРАМЕТРЫ:")
+print("="*60)
+for param, value in study.best_params.items():
+    print(f"  {param:20} = {value}")
+print(f"\n  Лучший MAE на валидации: {study.best_value:.4f}")
+print("="*60)
+
+# ==========================================
+# 5. ФИНАЛЬНАЯ МОДЕЛЬ С ОПТИМАЛЬНЫМИ ПАРАМЕТРАМИ
+# ==========================================
+best_params = study.best_params
+cb_final = CatBoostRegressor(
+    iterations=best_params['iterations'],
+    learning_rate=best_params['learning_rate'],
+    depth=best_params['depth'],
+    l2_leaf_reg=best_params['l2_leaf_reg'],
+    subsample=best_params['subsample'],
+    random_seed=42,
+    verbose=0,
+    cat_features=cat_cols,
+    task_type='CPU'
+)
+
+cb_final.fit(
+    pd.concat([X_train, X_val]),
+    pd.concat([y_train, y_val]),
+    eval_set=(X_test, y_test),
+    early_stopping_rounds=30,
+    use_best_model=True
+)
+
+# Оценка на тесте
+y_pred_test = cb_final.predict(X_test)
+mae_test = mean_absolute_error(y_test, y_pred_test)
+rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
+print(f"\n✅ Финальная модель обучена.")
+print(f"   MAE на тесте:  {mae_test:.4f}")
+print(f"   RMSE на тесте: {rmse_test:.4f}")
+
+# Сохранение модели
+cb_final.save_model('catboost_final_model.cbm')
+print("💾 Модель сохранена в 'catboost_final_model.cbm'")
+
+
+[32m[I 2026-07-20 22:48:05,825][0m Trial 49 finished with value: 0.6042331123558338 and parameters: {'iterations': 328, 'learning_rate': 0.027009317965431705, 'depth': 8, 'l2_leaf_reg': 3.013232734162048, 'subsample': 0.686543159236649}. Best is trial 33 with value: 0.5907250941530737.[0m
+
+============================================================
+ ЛУЧШИЕ ГИПЕРПАРАМЕТРЫ:
+============================================================
+  iterations           = 357
+  learning_rate        = 0.07713343019818823
+  depth                = 7
+  l2_leaf_reg          = 2.287504727750598
+  subsample            = 0.8464014971301436
+
+  Лучший MAE на валидации: 0.5907
+============================================================
+
+✅ Финальная модель обучена.
+   MAE на тесте:  0.6012
+   RMSE на тесте: 1.2017
+💾 Модель сохранена в 'catboost_final_model.cbm'
